@@ -19,14 +19,16 @@ class ReplayBuffer:
         self.obs2_buf = np.zeros(core.combined_shape(size, obs_dim), dtype=np.float32)
         self.act_buf = np.zeros(core.combined_shape(size, act_dim), dtype=np.float32)
         self.rew_buf = np.zeros(size, dtype=np.float32)
+        self.d_saf_buf = np.zeros(size, dtype=np.float32)
         self.done_buf = np.zeros(size, dtype=np.float32)
         self.ptr, self.size, self.max_size = 0, 0, size
 
-    def store(self, obs, act, rew, next_obs, done):
+    def store(self, obs, act, rew, next_obs, done, d_saf):
         self.obs_buf[self.ptr] = obs
         self.obs2_buf[self.ptr] = next_obs
         self.act_buf[self.ptr] = act
         self.rew_buf[self.ptr] = rew
+        self.d_saf_buf[self.ptr] = d_saf
         self.done_buf[self.ptr] = done
         self.ptr = (self.ptr + 1) % self.max_size
         self.size = min(self.size + 1, self.max_size)
@@ -37,6 +39,7 @@ class ReplayBuffer:
                      obs2=self.obs2_buf[idxs],
                      act=self.act_buf[idxs],
                      rew=self.rew_buf[idxs],
+                     d_saf=self.d_saf_buf[idxs],
                      done=self.done_buf[idxs])
         return {k: torch.as_tensor(v, dtype=torch.float32) for k, v in batch.items()}
 
@@ -45,7 +48,8 @@ def sac(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
         steps_per_epoch=4000, epochs=100, replay_size=int(1e6), gamma=0.99,
         polyak=0.995, lr=1e-3, alpha=0.2, batch_size=100, start_steps=10000,
         update_after=1000, update_every=50, num_test_episodes=10, max_ep_len=1000,
-        logger_kwargs=dict(), save_freq=1, initial_policy=lambda env, o: env.action_space.sample(), save_fcn=None):
+        logger_kwargs=dict(), save_freq=1, initial_policy=lambda env, o: env.action_space.sample(), save_fcn=None,
+        sigma=0):
     """
     Soft Actor-Critic (SAC)
 
@@ -210,13 +214,17 @@ def sac(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
     # Set up function for computing SAC pi loss
     def compute_loss_pi(data):
         o = data['obs']
+        s = data['d_saf']
         pi, logp_pi = ac.pi(o)
         q1_pi = ac.q1(o, pi)
         q2_pi = ac.q2(o, pi)
         q_pi = torch.min(q1_pi, q2_pi)
 
         # Entropy-regularized policy loss
-        loss_pi = (alpha * logp_pi - q_pi).mean()
+        if sigma != 0:
+            loss_pi = (alpha * logp_pi - q_pi - sigma*s).mean()
+        else:
+            loss_pi = (alpha * logp_pi - q_pi).mean()
 
         # Useful info for logging
         pi_info = dict(LogPi=logp_pi.detach().cpu().numpy())
@@ -297,7 +305,7 @@ def sac(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
             a = initial_policy(env, o)
 
         # Step the env
-        o2, r, d, _ = env.step(a)
+        o2, r, d, step_info = env.step(a)
         ep_ret += r
         ep_len += 1
 
@@ -307,7 +315,7 @@ def sac(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
         d = False if ep_len == max_ep_len else d
 
         # Store experience to replay buffer
-        replay_buffer.store(o, a, r, o2, d)
+        replay_buffer.store(o, a, r, o2, d, step_info['d_saf'] if sigma != 0 else 0)
 
         # Super critical, easy to overlook step: make sure to update 
         # most recent observation!

@@ -359,7 +359,7 @@ def sac(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
             logger.dump_tabular()
 
             if save_fcn is not None:
-                save_fcn(ac)
+                save_fcn(ac, (o, a,))
 
 
 if __name__ == '__main__':

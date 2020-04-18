@@ -228,7 +228,7 @@ def sac(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
 
         # Entropy-regularized policy loss
         if sigma != 0:
-            loss_pi = (alpha * logp_pi - q_pi + sigma * s_pi).mean()
+            loss_pi = (alpha * logp_pi - q_pi - sigma * s_pi).mean()
         else:
             loss_pi = (alpha * logp_pi - q_pi).mean()
 

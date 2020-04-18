@@ -175,6 +175,8 @@ def sac(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
     # List of parameters for both Q-networks (save this for convenience)
     q_params = itertools.chain(ac.q1.parameters(), ac.q2.parameters())
 
+    s_params = itertools.chain(ac.s1.parameters(), ac.s2.parameters())
+
     # Experience buffer
     replay_buffer = ReplayBuffer(obs_dim=obs_dim, act_dim=act_dim, size=replay_size)
 
@@ -183,11 +185,11 @@ def sac(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
     logger.log('\nNumber of parameters: \t pi: %d, \t q1: %d, \t q2: %d\n' % var_counts)
 
     # Set up function for computing SAC Q-losses
-    def compute_loss_q(data):
-        o, a, r, o2, d = data['obs'], data['act'], data['rew'], data['obs2'], data['done']
+    def compute_loss_q(data, n1='q1', n2='q2', key='rew'):
+        o, a, r, o2, d = data['obs'], data['act'], data[key], data['obs2'], data['done']
 
-        q1 = ac.q1(o, a)
-        q2 = ac.q2(o, a)
+        q1 = getattr(ac, n1)(o, a)
+        q2 = getattr(ac, n2)(o, a)
 
         # Bellman backup for Q functions
         with torch.no_grad():
@@ -195,8 +197,8 @@ def sac(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
             a2, logp_a2 = ac.pi(o2)
 
             # Target Q-values
-            q1_pi_targ = ac_targ.q1(o2, a2)
-            q2_pi_targ = ac_targ.q2(o2, a2)
+            q1_pi_targ = getattr(ac_targ, n1)(o2, a2)
+            q2_pi_targ = getattr(ac_targ, n2)(o2, a2)
             q_pi_targ = torch.min(q1_pi_targ, q2_pi_targ)
             backup = r + gamma * (1 - d) * (q_pi_targ - alpha * logp_a2)
 
@@ -220,9 +222,13 @@ def sac(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
         q2_pi = ac.q2(o, pi)
         q_pi = torch.min(q1_pi, q2_pi)
 
+        s1_pi = ac.s1(o, pi)
+        s2_pi = ac.s2(o, pi)
+        s_pi = torch.min(s1_pi, s2_pi)
+
         # Entropy-regularized policy loss
         if sigma != 0:
-            loss_pi = (alpha * logp_pi - q_pi - sigma*s).mean()
+            loss_pi = (alpha * logp_pi - q_pi + sigma * s_pi).mean()
         else:
             loss_pi = (alpha * logp_pi - q_pi).mean()
 
@@ -234,6 +240,7 @@ def sac(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
     # Set up optimizers for policy and q-function
     pi_optimizer = Adam(ac.pi.parameters(), lr=lr)
     q_optimizer = Adam(q_params, lr=lr)
+    s_optimizer = Adam(s_params, lr=lr)
 
     # Set up model saving
     logger.setup_pytorch_saver(ac)
@@ -244,6 +251,12 @@ def sac(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
         loss_q, q_info = compute_loss_q(data)
         loss_q.backward()
         q_optimizer.step()
+
+        # First run one gradient descent step for Q1 and Q2
+        s_optimizer.zero_grad()
+        loss_s, s_info = compute_loss_q(data, 's1', 's2', 'd_saf')
+        loss_s.backward()
+        s_optimizer.step()
 
         # Record things
         logger.store(LossQ=loss_q.item(), **q_info)

@@ -185,7 +185,7 @@ def sac(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
     logger.log('\nNumber of parameters: \t pi: %d, \t q1: %d, \t q2: %d\n' % var_counts)
 
     # Set up function for computing SAC Q-losses
-    def compute_loss_q(data, n1='q1', n2='q2', key='rew'):
+    def compute_loss_q(data, alpha_in, n1='q1', n2='q2', key='rew'):
         o, a, r, o2, d = data['obs'], data['act'], data[key], data['obs2'], data['done']
 
         q1 = getattr(ac, n1)(o, a)
@@ -200,7 +200,7 @@ def sac(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
             q1_pi_targ = getattr(ac_targ, n1)(o2, a2)
             q2_pi_targ = getattr(ac_targ, n2)(o2, a2)
             q_pi_targ = torch.min(q1_pi_targ, q2_pi_targ)
-            backup = r + gamma * (1 - d) * (q_pi_targ - alpha * logp_a2)
+            backup = r + gamma * (1 - d) * (q_pi_targ - alpha_in * logp_a2)
 
         # MSE loss against Bellman backup
         loss_q1 = ((q1 - backup) ** 2).mean()
@@ -213,34 +213,75 @@ def sac(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
 
         return loss_q, q_info
 
+    safety_active = sigma != 0
+
+    optimize_sigma = callable(sigma)
+
+    if optimize_sigma:
+        var_sigma = torch.tensor(0, dtype=torch.float32, requires_grad=True)
+    else:
+        var_sigma = sigma
+
+    optimize_alpha = callable(alpha)
+
+    if optimize_alpha:
+        var_alpha_ = torch.tensor(0, dtype=torch.float32, requires_grad=True)
+        var_alpha = var_alpha_
+    else:
+        var_alpha = alpha
+
     # Set up function for computing SAC pi loss
-    def compute_loss_pi(data):
+    def compute_loss_pi(data, alpha_in):
         o = data['obs']
-        s = data['d_saf']
+        if safety_active:
+            s = data['d_saf']
         pi, logp_pi = ac.pi(o)
         q1_pi = ac.q1(o, pi)
         q2_pi = ac.q2(o, pi)
         q_pi = torch.min(q1_pi, q2_pi)
 
-        s1_pi = ac.s1(o, pi)
-        s2_pi = ac.s2(o, pi)
-        s_pi = torch.min(s1_pi, s2_pi)
-
-        # Entropy-regularized policy loss
-        if sigma != 0:
-            loss_pi = (alpha * logp_pi - q_pi - sigma * s_pi).mean()
+        if safety_active:
+            s1_pi = ac.s1(o, pi)
+            s2_pi = ac.s2(o, pi)
+            s_pi = torch.min(s1_pi, s2_pi)
+            loss_pi = (alpha_in * logp_pi - q_pi - var_sigma * s_pi).mean()
         else:
-            loss_pi = (alpha * logp_pi - q_pi).mean()
+            # Entropy-regularized policy loss
+            s_pi = None
+            loss_pi = (alpha_in * logp_pi - q_pi).mean()
 
         # Useful info for logging
         pi_info = dict(LogPi=logp_pi.detach().cpu().numpy())
 
-        return loss_pi, pi_info
+        return loss_pi, pi_info, logp_pi, s_pi
+
+    def compute_loss_var_alpha(alpha_in, logp_pi):
+        alpha_constraint = alpha() * act_dim
+        pi_entropy = -torch.mean(logp_pi)
+        alpha_loss = - alpha_in * (alpha_constraint - pi_entropy)
+        return alpha_loss
+
+    def compute_loss_var_sigma(sigma_in, qc_in):
+        sigma_loss = sigma_in * (sigma() - qc_in)
+        return sigma_loss
+
+    var_alpha_fcn = torch.nn.functional.softplus
+    var_sigma_fcn = torch.nn.functional.softplus
 
     # Set up optimizers for policy and q-function
     pi_optimizer = Adam(ac.pi.parameters(), lr=lr)
     q_optimizer = Adam(q_params, lr=lr)
-    s_optimizer = Adam(s_params, lr=lr)
+    if safety_active:
+        s_optimizer = Adam(s_params, lr=lr)
+        print('safety Q functions active')
+
+    if optimize_alpha:
+        alpha_optimizer = Adam((var_alpha_,), lr=lr)
+        print(f'alpha is optimized with constraint {alpha()}')
+
+    if optimize_sigma:
+        sigma_optimizer = Adam(var_sigma, lr=lr)
+        print(f'sigma is optimized with constraint {sigma()}')
 
     # Set up model saving
     logger.setup_pytorch_saver(ac)
@@ -248,15 +289,16 @@ def sac(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
     def update(data):
         # First run one gradient descent step for Q1 and Q2
         q_optimizer.zero_grad()
-        loss_q, q_info = compute_loss_q(data)
+        loss_q, q_info = compute_loss_q(data, var_alpha_fcn(var_alpha))
         loss_q.backward()
         q_optimizer.step()
 
         # First run one gradient descent step for Q1 and Q2
-        s_optimizer.zero_grad()
-        loss_s, s_info = compute_loss_q(data, 's1', 's2', 'd_saf')
-        loss_s.backward()
-        s_optimizer.step()
+        if safety_active:
+            s_optimizer.zero_grad()
+            loss_s, s_info = compute_loss_q(data, var_alpha_fcn(var_alpha), 's1', 's2', 'd_saf')
+            loss_s.backward()
+            s_optimizer.step()
 
         # Record things
         logger.store(LossQ=loss_q.item(), **q_info)
@@ -268,9 +310,22 @@ def sac(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
 
         # Next run one gradient descent step for pi.
         pi_optimizer.zero_grad()
-        loss_pi, pi_info = compute_loss_pi(data)
+        loss_pi, pi_info, logp_pi, s_pi = compute_loss_pi(data, var_alpha_fcn(var_alpha))
         loss_pi.backward()
         pi_optimizer.step()
+
+        # alpha optimizer
+        if optimize_alpha:
+            alpha_optimizer.zero_grad()
+            loss_alpha = compute_loss_var_alpha(var_alpha_fcn(var_alpha), logp_pi.detach())
+            loss_alpha.backward()
+            alpha_optimizer.step()
+
+        if optimize_sigma:
+            sigma_optimizer.zero_grad()
+            loss_sigma = compute_loss_var_sigma(var_sigma_fcn(var_sigma), s_pi)
+            loss_sigma.backward()
+            sigma_optimizer.step()
 
         # Unfreeze Q-networks so you can optimize it at next DDPG step.
         for p in q_params:
@@ -328,7 +383,7 @@ def sac(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
         d = False if ep_len == max_ep_len else d
 
         # Store experience to replay buffer
-        replay_buffer.store(o, a, r, o2, d, step_info['d_saf'] if sigma != 0 else 0)
+        replay_buffer.store(o, a, r, o2, d, step_info['d_saf'] if safety_active else 0)
 
         # Super critical, easy to overlook step: make sure to update 
         # most recent observation!

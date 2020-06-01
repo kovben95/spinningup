@@ -262,11 +262,11 @@ def sac(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
         return alpha_loss
 
     def compute_loss_var_sigma(sigma_in, qc_in):
-        sigma_loss = sigma_in * (sigma() - qc_in)
-        return sigma_loss
+        sigma_loss = - sigma_in * (sigma() - qc_in)
+        return sigma_loss.mean()
 
-    var_alpha_fcn = torch.nn.functional.softplus
-    var_sigma_fcn = torch.nn.functional.softplus
+    var_alpha_fcn = torch.nn.functional.softplus if optimize_alpha else lambda k: k
+    var_sigma_fcn = torch.nn.functional.softplus if optimize_sigma else lambda k: k
 
     # Set up optimizers for policy and q-function
     pi_optimizer = Adam(ac.pi.parameters(), lr=lr)
@@ -280,7 +280,7 @@ def sac(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
         print(f'alpha is optimized with constraint {alpha()}')
 
     if optimize_sigma:
-        sigma_optimizer = Adam(var_sigma, lr=lr)
+        sigma_optimizer = Adam((var_sigma,), lr=lr)
         print(f'sigma is optimized with constraint {sigma()}')
 
     # Set up model saving
@@ -323,7 +323,7 @@ def sac(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
 
         if optimize_sigma:
             sigma_optimizer.zero_grad()
-            loss_sigma = compute_loss_var_sigma(var_sigma_fcn(var_sigma), s_pi)
+            loss_sigma = compute_loss_var_sigma(var_sigma_fcn(var_sigma), s_pi.detach())
             loss_sigma.backward()
             sigma_optimizer.step()
 
